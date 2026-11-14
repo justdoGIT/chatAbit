@@ -9,6 +9,7 @@
 // This is free and unencumbered software released into the public domain.
 //
 
+import Combine
 import SwiftUI
 
 struct MeshEmptyStateView: View {
@@ -19,6 +20,10 @@ struct MeshEmptyStateView: View {
     /// intro/help narration (the timeline isn't empty) and shrinks the
     /// radar, keeping the sightings tally and the live hints visible.
     var compact: Bool = false
+    /// Whether the radio can actually scan. With Bluetooth off or denied the
+    /// sweep must not run — an animated "searching" over a dead radio is an
+    /// actively false status display. Defaults to true for previews.
+    var bluetoothAvailable: Bool = true
 
     @EnvironmentObject private var locationChannelsModel: LocationChannelsModel
     @EnvironmentObject private var peerListModel: PeerListModel
@@ -69,8 +74,12 @@ struct MeshEmptyStateView: View {
 
     /// The radar means "searching for people": once anyone is connected or
     /// reachable on the mesh, the search is over and the sweep goes away.
+    /// And it only means that while the radio is actually on — the
+    /// connectivity banner carries the message when it isn't.
     private var isSearchingForPeers: Bool {
-        peerListModel.connectedMeshPeerCount == 0 && peerListModel.reachableMeshPeerCount == 0
+        bluetoothAvailable
+            && peerListModel.connectedMeshPeerCount == 0
+            && peerListModel.reachableMeshPeerCount == 0
     }
 
     var body: some View {

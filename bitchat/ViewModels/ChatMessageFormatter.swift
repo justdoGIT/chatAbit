@@ -9,6 +9,20 @@ final class ChatMessageFormatter {
     private unowned let viewModel: ChatViewModel
     private let meshPalette = MinimalDistancePalette(config: .mesh)
     private let nostrPalette = MinimalDistancePalette(config: .nostr)
+    /// What the Nostr palette was last built from. Colors are looked up once
+    /// per people-sheet row and per formatted geochat message, so the palette
+    /// is rebuilt only when the roster's membership (or our own excluded
+    /// key) changes rather than recomputing the roster on every lookup.
+    private var nostrPaletteKey: NostrPaletteKey?
+
+    private struct NostrPaletteKey: Equatable {
+        // periphery:ignore - read only via the synthesized Equatable
+        // conformance (the rebuild check), which the indexer cannot
+        // attribute.
+        let membershipRevision: UInt64
+        // periphery:ignore - see `membershipRevision`.
+        let excludedHex: String?
+    }
 
     init(viewModel: ChatViewModel) {
         self.viewModel = viewModel
@@ -41,7 +55,9 @@ final class ChatMessageFormatter {
         }()
 
         let isDark = colorScheme == .dark
-        if let cachedText = message.getCachedFormattedText(isDark: isDark, isSelf: isSelf, variant: theme.formatCacheVariant) {
+        let isVerifiedSender = !isSelf && isVerifiedSender(of: message)
+        let cacheVariant = theme.formatCacheVariant + (isVerifiedSender ? "-vf" : "")
+        if let cachedText = message.getCachedFormattedText(isDark: isDark, isSelf: isSelf, variant: cacheVariant) {
             return cachedText
         }
 
@@ -66,17 +82,19 @@ final class ChatMessageFormatter {
                 suffixStyle.foregroundColor = baseColor.opacity(0.6)
                 result.append(AttributedString(suffix).mergingAttributes(suffixStyle))
             }
+            // Private rows render a filled SF Symbol seal beside the lock
+            // (TextMessageView / MediaMessageView); skip the in-string ✓ there
+            // so verified DMs don't show two markers.
+            if isVerifiedSender, !message.isPrivate {
+                appendVerifiedSeal(to: &result, baseColor: baseColor, design: design)
+            }
             result.append(AttributedString("> ").mergingAttributes(senderStyle))
 
             let content = message.content
             let nsContent = content as NSString
             let nsLen = nsContent.length
-            let containsCashuEarly: Bool = {
-                let regex = Patterns.quickCashuPresence
-                return regex.numberOfMatches(in: content, options: [], range: NSRange(location: 0, length: nsLen)) > 0
-            }()
 
-            if (content.count > 4000 || content.hasVeryLongToken(threshold: 1024)) && !containsCashuEarly {
+            if content.isOversizedForRichFormatting() {
                 var plainStyle = AttributeContainer()
                 plainStyle.foregroundColor = baseColor
                 plainStyle.font = isSelf
@@ -187,7 +205,8 @@ final class ChatMessageFormatter {
                 allMatches.sort { $0.range.location < $1.range.location }
 
                 var lastEnd = content.startIndex
-                let isMentioned = message.mentions?.contains(viewModel.nickname) ?? false
+                let myNickname = viewModel.nickname.normalizedNickname
+                let isMentioned = message.mentions?.contains { $0.normalizedNickname == myNickname } ?? false
 
                 for (range, type) in allMatches {
                     guard let swiftRange = Range(range, in: content) else { continue }
@@ -339,9 +358,13 @@ final class ChatMessageFormatter {
             result.append(timestamp.mergingAttributes(timestampStyle))
         }
 
-        message.setCachedFormattedText(result, isDark: isDark, isSelf: isSelf, variant: theme.formatCacheVariant)
+        message.setCachedFormattedText(result, isDark: isDark, isSelf: isSelf, variant: cacheVariant)
         return result
     }
+
+    /// Prefix of the header's formatted-text cache variants. No full-text
+    /// variant starts with it, so the two caches can't collide.
+    static let headerCacheNamespace = "hdr:"
 
     func formatMessageHeader(_ message: BitchatMessage, colorScheme: ColorScheme, theme: AppTheme = .matrix) -> AttributedString {
         let design = theme.bodyFontDesign
@@ -359,13 +382,23 @@ final class ChatMessageFormatter {
         }()
 
         let isDark = colorScheme == .dark
+        let isVerifiedSender = !isSelf && isVerifiedSender(of: message)
+        // Same key ingredients as the full-text cache, in a namespace of its
+        // own so a header and a full text never answer each other's lookups.
+        let cacheVariant = Self.headerCacheNamespace + theme.formatCacheVariant + (isVerifiedSender ? "-vf" : "")
+        if let cachedHeader = message.getCachedFormattedText(isDark: isDark, isSelf: isSelf, variant: cacheVariant) {
+            return cachedHeader
+        }
+
         let baseColor: Color = isSelf ? .orange : peerColor(for: message, isDark: isDark)
 
         if message.sender == "system" {
             var style = AttributeContainer()
             style.foregroundColor = baseColor
             style.font = .bitchatSystem(size: 14, weight: .medium, design: design)
-            return AttributedString(message.sender).mergingAttributes(style)
+            let header = AttributedString(message.sender).mergingAttributes(style)
+            message.setCachedFormattedText(header, isDark: isDark, isSelf: isSelf, variant: cacheVariant)
+            return header
         }
 
         var result = AttributedString()
@@ -385,7 +418,11 @@ final class ChatMessageFormatter {
             suffixStyle.foregroundColor = baseColor.opacity(0.6)
             result.append(AttributedString(suffix).mergingAttributes(suffixStyle))
         }
+        if isVerifiedSender, !message.isPrivate {
+            appendVerifiedSeal(to: &result, baseColor: baseColor, design: design)
+        }
         result.append(AttributedString("> ").mergingAttributes(senderStyle))
+        message.setCachedFormattedText(result, isDark: isDark, isSelf: isSelf, variant: cacheVariant)
         return result
     }
 
@@ -431,6 +468,29 @@ final class ChatMessageFormatter {
 }
 
 private extension ChatMessageFormatter {
+    /// Whether the message sender has a fingerprint the user has verified.
+    /// Used for the in-chat seal next to `<@name>` so verification is visible
+    /// without opening the fingerprint sheet (#1439).
+    func isVerifiedSender(of message: BitchatMessage) -> Bool {
+        guard let peerID = message.senderPeerID,
+              let fingerprint = viewModel.getFingerprint(for: peerID) else {
+            return false
+        }
+        return viewModel.peerIdentityStore.isVerified(fingerprint)
+    }
+
+    func appendVerifiedSeal(
+        to result: inout AttributedString,
+        baseColor: Color,
+        design: Font.Design
+    ) {
+        var sealStyle = AttributeContainer()
+        // Match the peer-list verified seal: filled checkmark in the sender tint.
+        sealStyle.foregroundColor = baseColor
+        sealStyle.font = .bitchatSystem(size: 11, weight: .semibold, design: design)
+        result.append(AttributedString(" ✓").mergingAttributes(sealStyle))
+    }
+
     func peerColor(for message: BitchatMessage, isDark: Bool) -> Color {
         if let spid = message.senderPeerID {
             if spid.isGeoChat || spid.isGeoDM {
@@ -479,20 +539,31 @@ private extension ChatMessageFormatter {
             return .orange
         }
 
-        nostrPalette.ensurePalette(for: currentNostrPaletteSeeds(excluding: myHex))
+        ensureNostrPalette(excluding: myHex)
         if let color = nostrPalette.color(for: pubkeyHexLowercased, isDark: isDark) {
             return color
         }
         return Color(peerSeed: "nostr:" + pubkeyHexLowercased, isDark: isDark)
     }
 
-    func currentNostrPaletteSeeds(excluding myHex: String?) -> [String: String] {
+    /// Seeds the palette from the tracker's published roster, and only when
+    /// its membership changed. Rebuilding it from a fresh roster scan per
+    /// lookup made every people-sheet render O(N²) in the participant count.
+    func ensureNostrPalette(excluding myHex: String?) {
+        let tracker = viewModel.participantTracker
+        let key = NostrPaletteKey(
+            membershipRevision: tracker.visibleMembershipRevision,
+            excludedHex: myHex
+        )
+        guard key != nostrPaletteKey else { return }
+        nostrPaletteKey = key
+
         var seeds: [String: String] = [:]
         let excluded = myHex ?? ""
-        for person in viewModel.visibleGeohashPeople() where person.id != excluded {
+        for person in tracker.visiblePeople where person.id != excluded {
             seeds[person.id] = "nostr:" + person.id
         }
-        return seeds
+        nostrPalette.ensurePalette(for: seeds)
     }
 
     func currentGeohashIdentityHex() -> String? {

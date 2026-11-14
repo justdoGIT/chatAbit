@@ -323,6 +323,66 @@ struct MessageFormattingEngineTests {
         // Exactly at threshold DOES trigger (uses >= comparison)
         #expect(content.hasVeryLongToken(threshold: 50))
     }
+
+    @Test func isLongForDisplay_doesNotIgnoreCashuLinks() {
+        let cashu = "cashuA" + String(repeating: "a", count: 40)
+        let content = String(repeating: "a", count: TransportConfig.uiLongMessageLengthThreshold + 1) + " " + cashu
+
+        #expect(content.extractCashuLinks().count == 1)
+        #expect(content.isLongForDisplay())
+    }
+
+    @Test func contentScan_matchesTheStringScansAndIsCachedOnTheMessage() {
+        let cashu = "cashuA" + String(repeating: "a", count: 40)
+        let invoice = "lnbc1" + String(repeating: "q", count: 60)
+        let long = String(repeating: "a", count: TransportConfig.uiLongMessageLengthThreshold + 1)
+        let contents = [
+            "plain words",
+            "pay \(cashu) or lightning:\(invoice) or \(invoice)",
+            "\(long) \(cashu)",
+            "same \(cashu) twice \(cashu)"
+        ]
+
+        for content in contents {
+            let message = BitchatMessage(sender: "alice", content: content, timestamp: Date(), isRelay: false)
+            #expect(message.getCachedContentScan() == nil)
+
+            let scan = message.contentScan
+            #expect(scan.cashuLinks == content.extractCashuLinks())
+            #expect(scan.lightningLinks == content.extractLightningLinks())
+            #expect(scan.isLongForDisplay == content.isLongForDisplay())
+            #expect(message.getCachedContentScan() == scan)
+        }
+    }
+
+    @Test func contentScan_servesTheCachedScanWithoutRescanning() {
+        let cashu = "cashuA" + String(repeating: "a", count: 40)
+        let message = BitchatMessage(sender: "alice", content: "pay \(cashu)", timestamp: Date(), isRelay: false)
+        // A sentinel no scan of this content could produce.
+        let sentinel = BitchatMessage.ContentScan(cashuLinks: [], lightningLinks: ["lightning:sentinel"], isLongForDisplay: true)
+
+        message.setCachedContentScan(sentinel)
+
+        #expect(message.contentScan == sentinel)
+    }
+
+    @MainActor
+    @Test func formatMessage_longCashuMessageFallsBackToPlainContentPath() {
+        let context = MockMessageFormattingContext(nickname: "carol")
+        let cashu = "cashuA" + String(repeating: "a", count: 40)
+        let longContent = "hi @bob " + cashu + " " + String(repeating: "x", count: 4_100)
+        let message = BitchatMessage(
+            id: "long-cashu",
+            sender: "alice",
+            content: longContent,
+            timestamp: Date(timeIntervalSince1970: 1_700_000_999),
+            isRelay: false
+        )
+
+        let formatted = MessageFormattingEngine.formatMessage(message, context: context, colorScheme: .light)
+
+        #expect(String(formatted.characters) == "<@alice> \(longContent) [\(message.formattedTimestamp)]")
+    }
 }
 
 @MainActor

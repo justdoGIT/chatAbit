@@ -31,6 +31,10 @@ protocol ChatComposerContext: AnyObject {
     /// The transport's own nickname (excluded from autocomplete candidates).
     var meshNickname: String { get }
     func meshPeerNicknames() -> [PeerID: String]
+    /// True when this mesh nickname belongs to a blocked peer.
+    func isMeshNicknameBlocked(_ nickname: String) -> Bool
+    /// True when this geohash pubkey is blocked for location chats.
+    func isNostrBlocked(pubkeyHexLowercased: String) -> Bool
 
     // MARK: Geohash identity (shared with the other contexts)
     var geoNicknames: [String: String] { get }
@@ -40,8 +44,8 @@ protocol ChatComposerContext: AnyObject {
 extension ChatViewModel: ChatComposerContext {
     // `autocompleteSuggestions`, `autocompleteRange`, `showAutocomplete`,
     // `selectedAutocompleteIndex`, `nickname`, `myPeerID`, `activeChannel`,
-    // `geoNicknames`, `meshPeerNicknames()`, and
-    // `deriveNostrIdentity(forGeohash:)` are shared requirements with the
+    // `geoNicknames`, `meshPeerNicknames()`, `isNostrBlocked(pubkeyHexLowercased:)`,
+    // and `deriveNostrIdentity(forGeohash:)` are shared requirements with the
     // other contexts or satisfied by existing `ChatViewModel` members. The
     // members below flatten nested service accesses into intent-named calls.
 
@@ -60,6 +64,13 @@ extension ChatViewModel: ChatComposerContext {
     var meshNickname: String {
         meshService.myNickname
     }
+
+    func isMeshNicknameBlocked(_ nickname: String) -> Bool {
+        for (peerID, nick) in meshService.getPeerNicknames() where nick == nickname {
+            if isPeerBlocked(peerID) { return true }
+        }
+        return false
+    }
 }
 
 @MainActor
@@ -71,6 +82,14 @@ final class ChatComposerCoordinator {
     }
 
     func updateAutocomplete(for text: String, cursorPosition: Int) {
+        // The query can only suggest for an @-token ending at the cursor, so
+        // skip assembling the candidates (a pass over every mesh peer or
+        // geohash participant) after each typing pause in plain text.
+        guard AutocompleteService.hasMentionToken(in: text, cursorPosition: cursorPosition) else {
+            setAutocompleteState(suggestions: [], range: nil)
+            return
+        }
+
         let peerCandidates = autocompleteCandidates()
         let (suggestions, range) = context.autocompleteQuery(
             for: text,
@@ -78,17 +97,7 @@ final class ChatComposerCoordinator {
             cursorPosition: cursorPosition
         )
 
-        if !suggestions.isEmpty {
-            context.autocompleteSuggestions = suggestions
-            context.autocompleteRange = range
-            context.showAutocomplete = true
-            context.selectedAutocompleteIndex = 0
-        } else {
-            context.autocompleteSuggestions = []
-            context.autocompleteRange = nil
-            context.showAutocomplete = false
-            context.selectedAutocompleteIndex = 0
-        }
+        setAutocompleteState(suggestions: suggestions, range: suggestions.isEmpty ? nil : range)
     }
 
     func completeNickname(_ nickname: String, in text: inout String) -> Int {
@@ -132,15 +141,37 @@ final class ChatComposerCoordinator {
 }
 
 private extension ChatComposerCoordinator {
+    /// Shows `suggestions` (hidden when empty) with the highlight reset to the
+    /// first one. Writes only the properties that change: each write
+    /// republishes the composer state, which re-renders every message row.
+    func setAutocompleteState(suggestions: [String], range: NSRange?) {
+        let isShown = !suggestions.isEmpty
+        if context.autocompleteSuggestions != suggestions {
+            context.autocompleteSuggestions = suggestions
+        }
+        if context.autocompleteRange != range {
+            context.autocompleteRange = range
+        }
+        if context.showAutocomplete != isShown {
+            context.showAutocomplete = isShown
+        }
+        if context.selectedAutocompleteIndex != 0 {
+            context.selectedAutocompleteIndex = 0
+        }
+    }
+
     func autocompleteCandidates() -> [String] {
         switch context.activeChannel {
         case .mesh:
             let values = context.meshPeerNicknames().values
-            return Array(values.filter { $0 != context.meshNickname })
+            return Array(values.filter { nick in
+                nick != context.meshNickname && !context.isMeshNicknameBlocked(nick)
+            })
 
         case .location(let channel):
             var tokens = Set<String>()
             for (pubkey, nick) in context.geoNicknames {
+                guard !context.isNostrBlocked(pubkeyHexLowercased: pubkey) else { continue }
                 tokens.insert("\(nick)#\(pubkey.suffix(4))")
             }
             if let identity = try? context.deriveNostrIdentity(forGeohash: channel.geohash) {

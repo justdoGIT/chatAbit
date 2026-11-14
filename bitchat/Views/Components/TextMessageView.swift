@@ -23,7 +23,7 @@ struct TextMessageView: View {
     /// SAME instance would otherwise compare "unchanged" and this row's body
     /// would be skipped even though the parent list re-rendered. Snapshotting
     /// the enum makes the change visible to SwiftUI's structural diff.
-    private let deliveryStatus: DeliveryStatus?
+    private let deliveryStatus: DeliveryStatus
     @State private var expandedMessageIDs: Set<String> = []
     @State private var showDeliveryDetail = false
 
@@ -34,14 +34,12 @@ struct TextMessageView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Precompute heavy token scans once per row
-            let cashuLinks = message.content.extractCashuLinks()
-            let lightningLinks = message.content.extractLightningLinks()
+            // Heavy token scans run once per message, not once per render
+            let scan = message.contentScan
             // Baseline alignment keeps the lock and delivery glyphs on the
             // first text line; a fixed top padding left the lock's solid body
             // hanging below the line's visual center.
             HStack(alignment: .firstTextBaseline, spacing: 0) {
-                let isLong = (message.content.count > TransportConfig.uiLongMessageLengthThreshold || message.content.hasVeryLongToken(threshold: TransportConfig.uiVeryLongTokenThreshold)) && cashuLinks.isEmpty
                 let isExpanded = expandedMessageIDs.contains(message.id)
                 if message.isPrivate {
                     Image(systemName: "lock.fill")
@@ -49,6 +47,15 @@ struct TextMessageView: View {
                         .foregroundColor(Color.orange.opacity(0.75))
                         .padding(.trailing, 4)
                         .accessibilityHidden(true)
+                }
+                if conversationUIModel.showsVerifiedSeal(for: message) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.bitchatSystem(size: 8))
+                        .foregroundColor(Color.green.opacity(0.85))
+                        .padding(.trailing, 4)
+                        .accessibilityLabel(
+                            String(localized: "content.accessibility.verified_sender", defaultValue: "Verified sender", comment: "Accessibility label for the seal next to a verified peer's name on a private message")
+                        )
                 }
                 if message.isBridged {
                     Image(systemName: "network")
@@ -61,18 +68,18 @@ struct TextMessageView: View {
                 }
                 Text(conversationUIModel.formatMessage(message, colorScheme: colorScheme, theme: theme))
                     .fixedSize(horizontal: false, vertical: true)
-                    .lineLimit(isLong && !isExpanded ? TransportConfig.uiLongMessageLineLimit : nil)
+                    .lineLimit(scan.isLongForDisplay && !isExpanded ? TransportConfig.uiLongMessageLineLimit : nil)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 
                 // Delivery status indicator for private messages. Tappable:
                 // .help() tooltips only exist on macOS, so iOS users get the
                 // explanation as a caption under the row instead.
                 if message.isPrivate && conversationUIModel.isSentByCurrentUser(message),
-                   let status = deliveryStatus {
+                   deliveryStatus != .notSentYet {
                     Button {
                         showDeliveryDetail.toggle()
                     } label: {
-                        DeliveryStatusView(status: status)
+                        DeliveryStatusView(status: deliveryStatus)
                             .padding(.leading, 4)
                             .contentShape(Rectangle())
                     }
@@ -86,15 +93,15 @@ struct TextMessageView: View {
             // Failure reasons stay visible without a tap; other statuses
             // reveal on demand.
             if message.isPrivate && conversationUIModel.isSentByCurrentUser(message),
-               let status = deliveryStatus {
-                if case .failed = status {
-                    Text(verbatim: status.bitchatDescription)
+               deliveryStatus != .notSentYet {
+                if case .failed = deliveryStatus {
+                    Text(verbatim: deliveryStatus.bitchatDescription)
                         .bitchatFont(size: 11)
                         .foregroundColor(Color.red.opacity(0.9))
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
                 } else if showDeliveryDetail {
-                    Text(verbatim: status.bitchatDescription)
+                    Text(verbatim: deliveryStatus.bitchatDescription)
                         .bitchatFont(size: 11)
                         .foregroundColor(palette.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -103,7 +110,7 @@ struct TextMessageView: View {
             }
             
             // Expand/Collapse for very long messages
-            if (message.content.count > TransportConfig.uiLongMessageLengthThreshold || message.content.hasVeryLongToken(threshold: TransportConfig.uiVeryLongTokenThreshold)) && cashuLinks.isEmpty {
+            if scan.isLongForDisplay {
                 let isExpanded = expandedMessageIDs.contains(message.id)
                 let labelKey = isExpanded ? LocalizedStringKey("content.message.show_less") : LocalizedStringKey("content.message.show_more")
                 Button(labelKey) {
@@ -116,12 +123,12 @@ struct TextMessageView: View {
             }
 
             // Render payment chips (Lightning / Cashu) with rounded background
-            if !lightningLinks.isEmpty || !cashuLinks.isEmpty {
+            if !scan.lightningLinks.isEmpty || !scan.cashuLinks.isEmpty {
                 HStack(spacing: 8) {
-                    ForEach(lightningLinks, id: \.self) { link in
+                    ForEach(scan.lightningLinks, id: \.self) { link in
                         PaymentChipView(paymentType: .lightning(link))
                     }
-                    ForEach(cashuLinks, id: \.self) { link in
+                    ForEach(scan.cashuLinks, id: \.self) { link in
                         PaymentChipView(paymentType: .cashu(link))
                     }
                 }

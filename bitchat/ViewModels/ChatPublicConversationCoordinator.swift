@@ -24,10 +24,6 @@ protocol ChatPublicConversationContext: AnyObject {
     var currentGeohash: String? { get }
     var nickname: String { get }
     var myPeerID: PeerID { get }
-    /// Publishes the public-timeline batching state (UI animation suppression).
-    /// (Single mutation path for the owner's `isBatchingPublic`; this
-    /// coordinator never reads it.)
-    func setPublicBatching(_ isBatching: Bool)
     /// Signals that message state changed so observers refresh (e.g. `objectWillChange.send()`).
     func notifyUIChanged()
 
@@ -44,6 +40,9 @@ protocol ChatPublicConversationContext: AnyObject {
     func removePublicMessages(fromGeohash geohash: String, where predicate: (BitchatMessage) -> Bool)
     /// Empties a public conversation's timeline (`/clear`).
     func clearPublicConversation(_ conversationID: ConversationID)
+    /// Erases the on-disk archive of carried public mesh messages, so clearing
+    /// the mesh timeline deletes that history instead of only hiding it.
+    func purgeArchivedPublicMessages()
     /// Queues a system message for the next geohash channel visit.
     func queueGeohashSystemMessage(_ content: String)
 
@@ -246,14 +245,17 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
         )
     }
 
+    /// Runs once per participant on every roster rebuild, so keep it to one
+    /// lowercase copy: `publicKeyHex` is already lowercase.
     func displayNameForNostrPubkey(_ pubkeyHex: String) -> String {
         let suffix = String(pubkeyHex.suffix(4))
+        let key = pubkeyHex.lowercased()
         if let geohash = context.currentGeohash,
            let myGeoIdentity = try? context.deriveNostrIdentity(forGeohash: geohash),
-           myGeoIdentity.publicKeyHex.lowercased() == pubkeyHex.lowercased() {
+           myGeoIdentity.publicKeyHex == key {
             return context.nickname + "#" + suffix
         }
-        if let nick = context.geoNicknames[pubkeyHex.lowercased()], !nick.isEmpty {
+        if let nick = context.geoNicknames[key], !nick.isEmpty {
             return nick + "#" + suffix
         }
         return "anon#\(suffix)"
@@ -289,12 +291,14 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
         context.clearPublicConversation(ConversationID(channelID: context.activeChannel))
 
         // Clearing the mesh timeline also dismisses its archived echoes for
-        // good: the watermark stops the next launch from re-seeding them
-        // (the archive itself keeps carrying the messages for peers), and
-        // the dedup keys go so a cleared message arriving live shows again.
+        // good: the watermark stops the next launch from re-seeding them, the
+        // archive on disk is erased so the cleared history is actually gone
+        // rather than merely hidden, and the dedup keys go so a cleared
+        // message arriving live shows again.
         if case .mesh = context.activeChannel {
             MeshEchoSettings.clearedThrough = Date()
             archivedEchoKeys.removeAll()
+            context.purgeArchivedPublicMessages()
         }
 
         // The SPM test process shares the real Application Support tree, so this
@@ -430,8 +434,14 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
     }
 
     static func archivedEchoKey(senderPeerID: PeerID?, timestamp: Date, content: String) -> String {
-        let ms = UInt64((timestamp.timeIntervalSince1970 * 1000).rounded())
-        return "\(senderPeerID?.id ?? "")|\(ms)|\(content)"
+        // The timestamp is peer-chosen: a wire value near UInt64.max comes
+        // back from Date as 2^64, so a trapping UInt64(_:) here would be a
+        // remote crash. Anything that isn't an exact UInt64 keys on its
+        // Double form instead — still deterministic, which is all the dedup
+        // needs.
+        let ms = (timestamp.timeIntervalSince1970 * 1000).rounded()
+        let msKey = UInt64(exactly: ms).map { String($0) } ?? "\(ms)"
+        return "\(senderPeerID?.id ?? "")|\(msKey)|\(content)"
     }
 
     func handlePublicMessage(_ message: BitchatMessage, powBits: Int = 0) {
@@ -501,16 +511,17 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
     }
 
     func checkForMentions(_ message: BitchatMessage) {
-        var myTokens: Set<String> = [context.nickname]
+        let myNickname = context.nickname.normalizedNickname
+        var myTokens: Set<String> = [myNickname]
         let meshPeers = context.meshPeerNicknames()
-        let collisions = meshPeers.values.filter { $0.hasPrefix(context.nickname + "#") }
+        let collisions = meshPeers.values.filter { $0.normalizedNickname.hasPrefix(myNickname + "#") }
         if !collisions.isEmpty {
             let suffix = "#" + String(context.myPeerID.id.prefix(4))
-            myTokens = [context.nickname + suffix]
+            myTokens = [myNickname + suffix]
         }
-        let isMentioned = message.mentions?.contains(where: myTokens.contains) ?? false
+        let isMentioned = message.mentions?.contains { myTokens.contains($0.normalizedNickname) } ?? false
 
-        if isMentioned && message.sender != context.nickname {
+        if isMentioned && !isOwnMessage(message) {
             SecureLogger.info("🔔 Mention from \(message.sender)", category: .session)
             context.notifyMention(from: message.sender, message: message.content)
         }
@@ -535,7 +546,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
         let isHugForMe = message.content.contains("🫂") && hugsMe
         let isSlapForMe = message.content.contains("🐟") && slapsMe
 
-        if isHugForMe && message.sender != context.nickname {
+        if isHugForMe && !isOwnMessage(message) {
             let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
             impactFeedback.prepare()
 
@@ -546,7 +557,7 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
                     impactFeedback.impactOccurred()
                 }
             }
-        } else if isSlapForMe && message.sender != context.nickname {
+        } else if isSlapForMe && !isOwnMessage(message) {
             let impactFeedback = UIImpactFeedbackGenerator(style: .heavy)
             impactFeedback.prepare()
             impactFeedback.impactOccurred()
@@ -573,10 +584,6 @@ final class ChatPublicConversationCoordinator: PublicMessagePipelineDelegate {
     func pipelinePrewarmMessage(_: PublicMessagePipeline, message: BitchatMessage) {
         context.prewarmMessageFormatting(message)
     }
-
-    func pipelineSetBatchingState(_: PublicMessagePipeline, isBatching: Bool) {
-        context.setPublicBatching(isBatching)
-    }
 }
 
 private extension ChatPublicConversationCoordinator {
@@ -593,5 +600,16 @@ private extension ChatPublicConversationCoordinator {
             }
         }
         return "name:" + message.sender.lowercased()
+    }
+
+    /// Whether I wrote an inbound message (a gossip replay of my mesh text, or
+    /// a relay echo of my geochat text), by its sender ID rather than its
+    /// display name, so a namesake's mention or hug still reaches me.
+    func isOwnMessage(_ message: BitchatMessage) -> Bool {
+        message.isOwn(
+            myPeerID: context.myPeerID,
+            // The ID my own public rows carry in the active channel.
+            myGeoChatPeerID: currentPublicSender().peerID
+        )
     }
 }

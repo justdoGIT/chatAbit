@@ -3,7 +3,26 @@
 // Shared text parsing helpers for message rendering.
 //
 
+import BitFoundation
 import Foundation
+
+extension BitchatMessage {
+    /// The row's payment chips and collapse decision, scanned on first use
+    /// and cached on the message: a row re-renders far more often than its
+    /// immutable `content` could change.
+    var contentScan: ContentScan {
+        if let cached = getCachedContentScan() {
+            return cached
+        }
+        let scan = ContentScan(
+            cashuLinks: content.extractCashuLinks(),
+            lightningLinks: content.extractLightningLinks(),
+            isLongForDisplay: content.isLongForDisplay()
+        )
+        setCachedContentScan(scan)
+        return scan
+    }
+}
 
 extension String {
     // Detect if there is an extremely long token (no whitespace/newlines) that could break layout
@@ -19,6 +38,26 @@ extension String {
             }
         }
         return current >= threshold
+    }
+
+    /// True when the message should collapse behind Show more in the UI.
+    /// Length alone decides this — embedding a Cashu-looking token must not
+    /// disable the guard (remote DoS via unbounded layout).
+    func isLongForDisplay(
+        lengthThreshold: Int = TransportConfig.uiLongMessageLengthThreshold,
+        tokenThreshold: Int = TransportConfig.uiVeryLongTokenThreshold
+    ) -> Bool {
+        count > lengthThreshold || hasVeryLongToken(threshold: tokenThreshold)
+    }
+
+    /// True when rich formatting (regex / link detectors) should be skipped.
+    /// Cashu presence used to exempt oversized content from the plain path;
+    /// that let untrusted input force expensive formatting work.
+    func isOversizedForRichFormatting(
+        lengthThreshold: Int = 4000,
+        tokenThreshold: Int = 1024
+    ) -> Bool {
+        count > lengthThreshold || hasVeryLongToken(threshold: tokenThreshold)
     }
 
     // Extract up to `max` distinct Cashu tokens (cashuA/cashuB), as the bare

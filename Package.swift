@@ -19,7 +19,7 @@ let package = Package(
         .package(path: "localPackages/Arti"),
         .package(path: "localPackages/BitFoundation"),
         .package(path: "localPackages/BitLogger"),
-        .package(url: "https://github.com/21-DOT-DEV/swift-secp256k1", exact: "0.21.1")
+        .package(url: "https://github.com/21-DOT-DEV/swift-secp256k1", exact: "0.24.0")
     ],
     targets: [
         .executableTarget(
@@ -38,7 +38,10 @@ let package = Package(
                 "bitchat.entitlements",
                 "bitchat-macOS.entitlements",
                 "LaunchScreen.storyboard",
-                "ViewModels/Extensions/README.md"
+                "ViewModels/Extensions/README.md",
+                // Globe picker geometry, bundled by the Xcode app targets and read
+                // from Bundle.main; the SwiftPM build only runs tests.
+                "Resources/Globe"
             ],
             resources: [
                 .process("Localizable.xcstrings")
@@ -63,7 +66,11 @@ let package = Package(
                 // Only the vector fixture: declaring the whole "Noise"
                 // directory would claim its .swift test files as resources
                 // and silently drop them from compilation.
-                .process("Noise/NoiseTestVectors.json")
+                .process("Noise/NoiseTestVectors.json"),
+                // Frozen envelopes produced by the released iOS (733098bb)
+                // and Android (b7f0b33d) private-DM implementations; prove
+                // receive compatibility independently of the local generator.
+                .process("Nostr/Fixtures")
             ]
         )
     ]

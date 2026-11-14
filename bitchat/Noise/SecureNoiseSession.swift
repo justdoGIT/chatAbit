@@ -24,8 +24,12 @@ final class SecureNoiseSession: NoiseSession {
             throw NoiseSecurityError.sessionExhausted
         }
         
-        // Validate message size
-        guard NoiseSecurityValidator.validateMessageSize(plaintext) else {
+        // Ordinary Noise messages keep the protocol ceiling. Finalized media
+        // is the sole typed-payload extension and remains under the framed-file
+        // cap enforced again at the service and file-decoder layers.
+        let isPrivateFile = NoisePayloadType.isPrivateFile(rawValue: plaintext.first)
+            && NoiseSecurityValidator.validatePrivateFileMessageSize(plaintext)
+        guard NoiseSecurityValidator.validateMessageSize(plaintext) || isPrivateFile else {
             throw NoiseSecurityError.messageTooLarge
         }
         
@@ -42,8 +46,11 @@ final class SecureNoiseSession: NoiseSession {
             throw NoiseSecurityError.sessionExpired
         }
         
-        // Validate message size
-        guard NoiseSecurityValidator.validateMessageSize(ciphertext) else {
+        // The payload type is encrypted, so a large candidate can only be
+        // bounded here; `NoiseEncryptionService.decrypt` authenticates it and
+        // then requires the resulting type to be `.privateFile`.
+        guard NoiseSecurityValidator.validateCiphertextSize(ciphertext)
+                || NoiseSecurityValidator.validatePrivateFileCiphertextSize(ciphertext) else {
             throw NoiseSecurityError.messageTooLarge
         }
         
@@ -59,12 +66,24 @@ final class SecureNoiseSession: NoiseSession {
         if messageCount >= messageThreshold {
             return true
         }
-        
-        // Check if last activity was more than 30 minutes ago
+
+        // Check if last activity exceeded sessionTimeout
         if Date().timeIntervalSince(lastActivityTime) > NoiseSecurityConstants.sessionTimeout {
             return true
         }
-        
+
+        // A session that never goes idle (a long-lived conversation with
+        // steady traffic) keeps refreshing lastActivityTime forever, so the
+        // check above never fires -- only sessionStartTime tracks how close
+        // encrypt/decrypt are to the hard sessionExpired cutoff above. Firing
+        // at 90% of sessionTimeout leaves the rekey timer's polling interval
+        // (checked every 60s, see NoiseEncryptionService.rekeyCheckInterval)
+        // room to complete a full handshake well before the old session
+        // starts throwing sessionExpired on every call.
+        if Date().timeIntervalSince(sessionStartTime) > NoiseSecurityConstants.sessionTimeout * 0.9 {
+            return true
+        }
+
         return false
     }
     

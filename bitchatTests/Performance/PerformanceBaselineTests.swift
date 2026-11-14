@@ -42,7 +42,8 @@ final class PerformanceBaselineTests: XCTestCase {
     /// appended to the file named by `BITCHAT_PERF_LOG` (if set): under
     /// `swift test --parallel` the runner swallows stdout of passing tests,
     /// so the CI floor gate (scripts/check-perf-floors.sh) reads the file.
-    private func reportThroughput(_ name: String, samples: [TimeInterval], operations: Int, unit: String) {
+    /// Internal so benchmark extensions in other files report the same way.
+    func reportThroughput(_ name: String, samples: [TimeInterval], operations: Int, unit: String) {
         guard !samples.isEmpty else { return }
         let avg = samples.reduce(0, +) / Double(samples.count)
         let opsPerSec = avg > 0 ? Double(operations) / avg : .infinity
@@ -77,8 +78,10 @@ final class PerformanceBaselineTests: XCTestCase {
     // MARK: - 1a. Nostr inbound event handling (fresh events)
 
     /// `NostrInboundPipeline.handleNostrEvent` for never-seen geo events
-    /// (kind 20000): signature verification, dedup record, presence/nickname
-    /// bookkeeping, and public-message ingest scheduling.
+    /// (kind 20000): dedup record, presence/nickname bookkeeping, and
+    /// public-message ingest scheduling. Schnorr signature verification is
+    /// NOT part of this path anymore — it runs exactly once, off the main
+    /// actor, in `NostrRelayManager` before delivery.
     func testNostrInboundEventHandling_freshEvents() throws {
         let events = try Self.makeSignedGeohashEvents(count: 500)
         // A fresh context per measure pass so every event takes the
@@ -106,8 +109,9 @@ final class PerformanceBaselineTests: XCTestCase {
 
     /// The dedup-hit path: identical events replayed. Duplicates dominate
     /// real relay traffic (the same event arrives from several relays), so
-    /// this path runs hundreds of times a minute in busy geohashes. Note it
-    /// still pays full Schnorr signature verification before the dedup check.
+    /// this path runs hundreds of times a minute in busy geohashes. It is a
+    /// pure dedup lookup: no crypto (verification happens upstream in
+    /// `NostrRelayManager`, and only for the first-seen copy).
     func testNostrInboundEventHandling_duplicateEvents() throws {
         let events = try Self.makeSignedGeohashEvents(count: 500)
         let context = PerfNostrContext()
@@ -501,6 +505,62 @@ final class PerformanceBaselineTests: XCTestCase {
         reportThroughput("store.append", samples: samples, operations: messageCount, unit: "messages")
     }
 
+    // MARK: - 7b. ConversationStore append at the retention cap
+
+    /// Steady-state public timeline traffic after the 1337-message retention
+    /// cap has been reached. Every tail append evicts the oldest row, which is
+    /// the long-lived workload the cold `store.append` benchmark does not
+    /// exercise.
+    func testConversationStoreSteadyStateAppend() {
+        let store = ConversationStore()
+        let cap = TransportConfig.meshTimelineCap
+        let messagesPerPass = 500
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+
+        for i in 0..<cap {
+            store.append(
+                BitchatMessage(
+                    id: "perf-steady-seed-\(i)",
+                    sender: "perfsender",
+                    content: "steady-state seed \(i)",
+                    timestamp: base.addingTimeInterval(Double(i)),
+                    isRelay: false
+                ),
+                to: .mesh
+            )
+        }
+
+        var pass = 0
+        var samples: [TimeInterval] = []
+        measure {
+            let startIndex = cap + pass * messagesPerPass
+            let start = Date()
+            for offset in 0..<messagesPerPass {
+                let i = startIndex + offset
+                store.append(
+                    BitchatMessage(
+                        id: "perf-steady-\(i)",
+                        sender: "perfsender",
+                        content: "steady-state message \(i)",
+                        timestamp: base.addingTimeInterval(Double(i)),
+                        isRelay: false
+                    ),
+                    to: .mesh
+                )
+            }
+            samples.append(Date().timeIntervalSince(start))
+            pass += 1
+            XCTAssertEqual(store.conversation(for: .mesh).messages.count, cap)
+        }
+
+        reportThroughput(
+            "store.steadyStateAppend",
+            samples: samples,
+            operations: messagesPerPass,
+            unit: "messages"
+        )
+    }
+
     // MARK: - 8. ConversationStore invariant audit (field observability)
 
     /// `ConversationStore.auditInvariants()` over a realistic 5k-message
@@ -653,8 +713,11 @@ private final class PerfNostrContext: ChatNostrContext {
     func stopGeoParticipantRefreshTimer() {}
     func setActiveParticipantGeohash(_ geohash: String?) {}
     private(set) var participantRecords = 0
-    func recordGeoParticipant(pubkeyHex: String) { participantRecords += 1 }
-    func recordGeoParticipant(pubkeyHex: String, geohash: String) { participantRecords += 1 }
+    func recordGeoParticipant(pubkeyHex: String, seenAt: Date) -> Bool {
+        participantRecords += 1
+        return true
+    }
+    func recordGeoParticipant(pubkeyHex: String, geohash: String, seenAt: Date) { participantRecords += 1 }
     func geoParticipantCount(for geohash: String) -> Int { 0 }
     func setGeoNickname(_ nickname: String, forPubkey pubkeyHex: String) { geoNicknames[pubkeyHex.lowercased()] = nickname }
     func markGeoTeleported(_ pubkeyHexLowercased: String) { teleportedKeys.insert(pubkeyHexLowercased) }
@@ -690,10 +753,28 @@ private final class PerfDeliveryContext: ChatDeliveryContext {
 
     func notifyUIChanged() {}
     func markMessageDelivered(_ messageID: String) {}
+    func markMessageDelivered(_ messageID: String, from peerIDs: Set<PeerID>) {}
+    func confirmPrivateMediaDelivery(_ messageID: String) {}
+    func isOutgoingPrivateMessage(_ messageID: String, toAny peerIDs: Set<PeerID>) -> Bool {
+        true
+    }
 
     @discardableResult
     func setDeliveryStatus(_ status: DeliveryStatus, forMessageID messageID: String) -> Bool {
         store.setDeliveryStatus(status, forMessageID: messageID)
+    }
+
+    @discardableResult
+    func setDeliveryStatus(
+        _ status: DeliveryStatus,
+        forMessageID messageID: String,
+        inDirectPeerAliases peerIDs: Set<PeerID>
+    ) -> Bool {
+        store.setDeliveryStatus(
+            status,
+            forMessageID: messageID,
+            inDirectPeerAliases: peerIDs
+        )
     }
 
     func deliveryStatus(forMessageID messageID: String) -> DeliveryStatus? {
